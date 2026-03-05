@@ -119,6 +119,45 @@ func _D3D11CreateDevice(ppDevice **ID3D11Device, ppDeviceContext **ID3D11DeviceC
 	return nil
 }
 
+func NewD3D11DeviceWithAdapter(adapter *dxgi.IDXGIAdapter1) (*ID3D11Device, *ID3D11DeviceContext, error) {
+	var device *ID3D11Device
+	var deviceCtx *ID3D11DeviceContext
+
+	fflags := [...]uint32{
+		0xc100, // D3D_FEATURE_LEVEL_12_1
+		0xc000, // D3D_FEATURE_LEVEL_12_0
+		0xb100, // D3D_FEATURE_LEVEL_11_1
+		0xb000, // D3D_FEATURE_LEVEL_11_0
+		0xa100, // D3D_FEATURE_LEVEL_10_1
+		0xa000, // D3D_FEATURE_LEVEL_10_0
+	}
+	featureLevel := 0x9100
+	flags := 0
+	const D3D_DRIVER_TYPE_UNKNOWN = 0 // DriverType MUST be UNKNOWN if pAdapter is non-nil
+
+	ret, _, _ := syscall.SyscallN(
+		procD3D11CreateDevice.Addr(),
+		uintptr(unsafe.Pointer(adapter)),    // pAdapter
+		uintptr(D3D_DRIVER_TYPE_UNKNOWN),    // driverType: 0 = Unknown
+		uintptr(0),                          // software
+		uintptr(flags),                      // flags
+		uintptr(unsafe.Pointer(&fflags[0])), // supported feature levels
+		uintptr(len(fflags)),                // number of levels
+		uintptr(D3D11_SDK_VERSION),
+		uintptr(unsafe.Pointer(&device)),       // *D3D11Device
+		uintptr(unsafe.Pointer(&featureLevel)), // feature level
+		uintptr(unsafe.Pointer(&deviceCtx)),    // *D3D11DeviceContext
+	)
+
+	if ret != 0 {
+		return nil, nil, d3d.HRESULT(ret)
+	}
+	if device == nil || deviceCtx == nil {
+		return nil, nil, fmt.Errorf("device or context is nil")
+	}
+	return device, deviceCtx, nil
+}
+
 func NewD3D11Device() (*ID3D11Device, *ID3D11DeviceContext, error) {
 	var device *ID3D11Device
 	var deviceCtx *ID3D11DeviceContext

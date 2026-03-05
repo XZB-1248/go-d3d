@@ -208,7 +208,14 @@ type IDXGIOutput struct {
 func (obj *IDXGIOutput) QueryInterface(iid windows.GUID, pp interface{}) int32 {
 	return com.ReflectQueryInterface(obj, obj.vtbl.QueryInterface, &iid, pp)
 }
-
+func (obj *IDXGIOutput) GetDesc(desc *DXGI_OUTPUT_DESC) int32 {
+	ret, _, _ := syscall.SyscallN(
+		obj.vtbl.GetDesc,
+		uintptr(unsafe.Pointer(obj)),
+		uintptr(unsafe.Pointer(desc)),
+	)
+	return int32(ret)
+}
 func (obj *IDXGIOutput) GetParent(iid windows.GUID, pp *unsafe.Pointer) int32 {
 	ret, _, _ := syscall.SyscallN(
 		obj.vtbl.GetParent,
