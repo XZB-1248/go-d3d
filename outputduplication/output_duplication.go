@@ -22,6 +22,28 @@ type PointerInfo struct {
 	visible        bool
 }
 
+// MoveRect describes a region that was moved within the frame.
+// The region at Source was relocated to Destination.
+type MoveRect struct {
+	Source      image.Point
+	Destination image.Rectangle
+}
+
+// FrameInfo contains metadata about the changes in a captured frame.
+//
+// When DirtyRects is non-nil the caller should only transmit those regions;
+// all other pixels are unchanged from the previous frame.
+// When DirtyRects is nil the full image should be treated as dirty (e.g. the
+// first frame, a resolution change, or a frame with move rects).
+type FrameInfo struct {
+	// DirtyRects lists the screen regions that changed since the last frame.
+	// nil means the entire frame is dirty (full refresh).
+	DirtyRects []image.Rectangle
+	// MoveRects lists regions that were moved (e.g. scroll). When non-empty,
+	// DirtyRects is nil and the full image should be considered dirty.
+	MoveRects []MoveRect
+}
+
 type OutputDuplicator struct {
 	device            *d3d11.ID3D11Device
 	deviceCtx         *d3d11.ID3D11DeviceContext
@@ -40,10 +62,11 @@ type OutputDuplicator struct {
 	UpdatePointerInfo bool
 
 	// TODO: handle DPI? Do we need it?
-	dirtyRects    []dxgi.RECT
-	movedRects    []dxgi.DXGI_OUTDUPL_MOVE_RECT
-	acquiredFrame bool
-	needsSwizzle  bool // in case we use DuplicateOutput1, swizzle is not neccessery
+	dirtyRects           []dxgi.RECT
+	movedRects           []dxgi.DXGI_OUTDUPL_MOVE_RECT
+	acquiredFrame        bool
+	needsSwizzle         bool // in case we use DuplicateOutput1, swizzle is not neccessery
+	lastFrameHadMetadata bool // true when the latest Snapshot call received per-rect metadata
 }
 
 func (dup *OutputDuplicator) initializeStage(texture *d3d11.ID3D11Texture2D) int32 {
@@ -168,6 +191,12 @@ func (dup *OutputDuplicator) Snapshot(timeoutMs uint) (unmapFn, *dxgi.DXGI_MAPPE
 		}
 	}
 
+	// Reset per-frame metadata slices so stale data from a previous frame is never
+	// visible to callers of GetImageWithFrameInfo.
+	dup.movedRects = dup.movedRects[:0]
+	dup.dirtyRects = dup.dirtyRects[:0]
+	dup.lastFrameHadMetadata = frameInfo.TotalMetadataBufferSize > 0
+
 	// NOTE: we could use a single, large []byte buffer and use it as storage for moved rects & dirty rects
 	if frameInfo.TotalMetadataBufferSize > 0 {
 		// Handling moved / dirty rects, to reduce GPU<->CPU memory copying
@@ -224,10 +253,7 @@ func (dup *OutputDuplicator) Snapshot(timeoutMs uint) (unmapFn, *dxgi.DXGI_MAPPE
 	} else {
 		// no frame metadata, copy whole image
 		dup.deviceCtx.CopyResource2D(dup.stagedTex, desktop2d)
-		if !dup.needsSwizzle {
-			dup.needsSwizzle = true
-		}
-		print("no frame metadata\n")
+		dup.needsSwizzle = true
 	}
 
 	hr = dup.surface.Map(&dup.mappedRect, dxgi.DXGI_MAP_READ)
@@ -239,6 +265,72 @@ func (dup *OutputDuplicator) Snapshot(timeoutMs uint) (unmapFn, *dxgi.DXGI_MAPPE
 
 func (dup *OutputDuplicator) DrawCursor(img *image.RGBA) error {
 	return dup.drawPointer(img)
+}
+
+// GetImageWithFrameInfo captures a frame into img and returns FrameInfo with
+// the DXGI-native dirty/move rectangles so callers can avoid a full image
+// comparison.
+//
+// FrameInfo.DirtyRects is non-nil only when there are no move rects and the
+// driver received proper per-frame metadata from DXGI. In all other cases
+// (first frame with no metadata, move rects present, or the fast-path system-
+// memory path) DirtyRects is nil, signalling that the full image is dirty.
+func (dup *OutputDuplicator) GetImageWithFrameInfo(img *image.RGBA, timeoutMs uint) (*FrameInfo, error) {
+	unmap, mappedRect, size, err := dup.Snapshot(timeoutMs)
+	if err != nil {
+		return nil, err
+	}
+	defer unmap()
+
+	// Copy image data – identical to GetImage.
+	dataSize := int(mappedRect.Pitch) * int(size.Y)
+	data := unsafe.Slice((*byte)(mappedRect.PBits), dataSize)
+	contentWidth := int(size.X) * 4
+	dataWidth := int(mappedRect.Pitch)
+	var imgStart, dataStart int
+	for i := 0; i < int(size.Y); i++ {
+		copy(img.Pix[imgStart:], data[dataStart:dataStart+contentWidth])
+		imgStart += contentWidth
+		dataStart += dataWidth
+	}
+	if dup.needsSwizzle {
+		swizzle.BGRA(img.Pix)
+	}
+	if dup.DrawPointer {
+		dup.drawPointer(img)
+	}
+
+	// Build FrameInfo from the metadata already fetched by Snapshot.
+	info := &FrameInfo{}
+
+	// When DXGI provided no per-frame metadata, the full frame is dirty.
+	// Return DirtyRects == nil to signal a full refresh to the caller.
+	if !dup.lastFrameHadMetadata {
+		return info, nil
+	}
+
+	if len(dup.movedRects) > 0 {
+		// Expose move rects to the caller; DirtyRects stays nil so the caller
+		// knows to treat the full image as dirty.
+		info.MoveRects = make([]MoveRect, len(dup.movedRects))
+		for i, mr := range dup.movedRects {
+			info.MoveRects[i] = MoveRect{
+				Source: image.Pt(int(mr.Src.X), int(mr.Src.Y)),
+				Destination: image.Rect(
+					int(mr.Dest.Left), int(mr.Dest.Top),
+					int(mr.Dest.Right), int(mr.Dest.Bottom),
+				),
+			}
+		}
+		return info, nil
+	}
+
+	// No move rects: expose dirty rects directly.
+	info.DirtyRects = make([]image.Rectangle, len(dup.dirtyRects))
+	for i, r := range dup.dirtyRects {
+		info.DirtyRects[i] = image.Rect(int(r.Left), int(r.Top), int(r.Right), int(r.Bottom))
+	}
+	return info, nil
 }
 
 func (dup *OutputDuplicator) GetImage(img *image.RGBA, timeoutMs uint) error {
